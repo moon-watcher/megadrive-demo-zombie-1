@@ -1,0 +1,3 @@
+; to put the data in a "res" folder, else it will compiled by GenRes AND GDK's bitmap compiler
+; BITMAP logo "data/logo.bmp" 0
+; it's VERY important to finish by a new line ! else the last resource won't be compiled

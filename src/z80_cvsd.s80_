@@ -1,0 +1,777 @@
+#target bin
+#code $0000, $2000
+
+; cvsd compressed sample player Z80 driver
+; Joe Fenton (C)2009 based partly on code by
+; Stéphane Dallongeville (C)2007
+
+YMPORT0     EQU $4000   ; YM2612 port 0
+YMPORT1     EQU $4001   ; YM2612 port 1
+YMPORT2     EQU $4002   ; YM2612 port 2
+YMPORT3     EQU $4003   ; YM2612 port 3
+BANKREG     EQU $6000   ; Bank register
+PSGPORT     EQU $7F11   ; PSG port
+
+STARTPTRL   EQU $0040   ; start pointer low
+STARTPTRM   EQU $0041   ; start pointer mid
+STARTPTRH   EQU $0042   ; start pointer high
+STARTLENL   EQU $0043   ; start length low
+STARTLENM   EQU $0044   ; start length mid
+STARTLENH   EQU $0045   ; start length high
+
+CURRLENL    EQU $0046   ; current length low
+CURRLENM    EQU $0047   ; current length mid
+CURRLENH    EQU $0048   ; current length high
+
+FIRST       EQU $004C   ; first byte in stream
+
+PAN         EQU $004D   ; left, center, right
+PLAY        EQU $004E   ; command from 68K
+PAUSE       EQU $004F   ; pause playback
+
+; ########################### Code starts here ##############################
+
+;   ORG $0000
+
+; basic init code
+
+    DI                      ; Disable ints
+    LD  SP, $2000           ; Setup stack
+    IM  $01                 ; Set int mode 1
+    JP  start               ; Jump to start
+
+
+; ########################## Interrupt handler ##############################
+
+;   ORG  $0038
+    defs $0038 - $
+
+interrupt
+    RETI
+
+
+; ############################## Main code ##################################
+
+;   ORG  $0080
+    defs $0080 - $
+
+start
+    LD  B, $10
+    XOR A
+    LD  HL, $0040
+clr_vars
+    LD  (HL), A             ; clear ram variables
+    INC HL
+    DJNZ clr_vars
+
+    LD  IY, YMPORT0
+    LD  (IY+2), $B6         ; point to channel 6 stereo register
+
+    LD  HL, YMPORT0
+    LD  BC, YMPORT1
+    LD  A, $80
+    LD  (HL), $2B
+    LD  (BC), A             ; enable DAC
+    LD  (HL), $2A
+    LD  (BC), A             ; DAC data to silent
+
+idle
+    LD  A, (PLAY)           ; load command in A
+    OR  A
+    JR  Z, idle             ; wait for command
+
+; start playback
+
+    LD  A, (PAN)
+    LD  (YMPORT3), A        ; set pan
+
+restart
+    ; initialize last bit, delta, and last sample
+    LD  A, (FIRST)
+    XOR $80                 ; inverse of first bit
+    RLCA
+    LD  C, A                ; last bit = inverse of first bit
+    LD  DE, 2               ; delta = minDelta
+    LD  HL, 0               ; last sample = 0
+    EXX                     ; save
+
+    ; copy length
+    LD  BC, (STARTLENL)
+    LD  A, (STARTLENH)
+    LD  (CURRLENL), BC
+    LD  (CURRLENH), A
+
+    LD  DE, (STARTPTRM)     ; initial bank address
+
+    LD  BC, (STARTPTRL)
+    SET 7, B                ; initial bank ptr = 0x8000 + (STARTPTR & 0x7FFF)
+    LD  YH, B
+    LD  YL, C
+
+    RES 7, B                ; STARTPTR & 0x7FFF
+    LD  HL, $8000
+    AND A                   ; clear CF
+    SBC HL, BC              ; bank count = length to next 32KB boundary
+
+outer_loop
+    LD  A, (CURRLENH)
+    AND A
+    JP  NZ, set_bank_len    ; at least 64KB left
+    LD  A, (CURRLENL)
+    SUB L
+    LD  A, (CURRLENM)
+    SBC A, H
+    JP  P, set_bank_len     ; > 0 means current length > bank length
+    LD  HL, (CURRLENL)      ; <= 0 means current length <= bank length
+set_bank_len
+    PUSH HL
+    POP IX                  ; set working bank count
+
+    CALL set_bank           ; set bank address using DE
+
+    EXX                     ; swap bank count and address with last bit, delta, and last sample
+
+inner_loop
+    LD  A, (PAUSE)
+    OR  A
+    JP  NZ, pause           ; playback paused
+
+    LD  B, (IY+0)           ; next 8 bits of compressed data
+
+    ; check bit 7
+    RLC B                   ; get bit 7
+    JR  C, this_bit7_1
+
+    ; this bit 7 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_70     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_70          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_70
+not_same_70
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_70          ; no
+    LD  E, 2                ; delta = minDelta
+cont_70
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_70
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_70
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_6
+
+this_bit7_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_71      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_71          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_71
+not_same_71
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_71          ; no
+    LD  E, 2                ; delta = minDelta
+cont_71
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_71
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_71
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_6
+    RLC B                   ; get bit 6
+    JR  C, this_bit6_1
+
+    ; this bit 6 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_60     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_60          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_60
+not_same_60
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_60          ; no
+    LD  E, 2                ; delta = minDelta
+cont_60
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_60
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_60
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_5
+
+this_bit6_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_61      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_61          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_61
+not_same_61
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_61          ; no
+    LD  E, 2                ; delta = minDelta
+cont_61
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_61
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_61
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_5
+    INC IY
+    RLC B                   ; get bit 5
+    JR  C, this_bit5_1
+
+    ; this bit 5 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_50     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_50          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_50
+not_same_50
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_50          ; no
+    LD  E, 2                ; delta = minDelta
+cont_50
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_50
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_50
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_4
+
+this_bit5_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_51      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_51          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_51
+not_same_51
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_51          ; no
+    LD  E, 2                ; delta = minDelta
+cont_51
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_51
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_51
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_4
+    RLC B                   ; get bit 4
+    JR  C, this_bit4_1
+
+    ; this bit 4 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_40     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_40          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_40
+not_same_40
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_40          ; no
+    LD  E, 2                ; delta = minDelta
+cont_40
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_40
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_40
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_3
+
+this_bit4_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_41      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_41          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_41
+not_same_41
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_41          ; no
+    LD  E, 2                ; delta = minDelta
+cont_41
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_41
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_41
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_3
+    RLC B                   ; get bit 3
+    JR  C, this_bit3_1
+
+    ; this bit 3 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_30     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_30          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_30
+not_same_30
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_30          ; no
+    LD  E, 2                ; delta = minDelta
+cont_30
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_30
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_30
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_2
+
+this_bit3_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_31      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_31          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_31
+not_same_31
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_31          ; no
+    LD  E, 2                ; delta = minDelta
+cont_31
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_31
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_31
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_2
+    DEC IX
+    RLC B                   ; get bit 2
+    JR  C, this_bit2_1
+
+    ; this bit 2 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_20     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_20          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_20
+not_same_20
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_20          ; no
+    LD  E, 2                ; delta = minDelta
+cont_20
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_20
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_20
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_1
+
+this_bit2_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_21      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_21          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_21
+not_same_21
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_21          ; no
+    LD  E, 2                ; delta = minDelta
+cont_21
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_21
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_21
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_1
+    RLC B                   ; get bit 1
+    JR  C, this_bit1_1
+
+    ; this bit 1 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_10     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_10          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_10
+not_same_10
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_10          ; no
+    LD  E, 2                ; delta = minDelta
+cont_10
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_10
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_10
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  chk_bit_0
+
+this_bit1_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_11      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_11          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_11
+not_same_11
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_11          ; no
+    LD  E, 2                ; delta = minDelta
+cont_11
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_11
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_11
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+chk_bit_0
+    RLC B                   ; get bit 0
+    JR  C, this_bit0_1
+
+    ; this bit 0 is 0
+    BIT 0, C                ; check last bit
+    JR  NZ, not_same_00     ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_00          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_00
+not_same_00
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_00          ; no
+    LD  E, 2                ; delta = minDelta
+cont_00
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    SBC HL, DE              ; last sample -= delta
+    JP  PO, filter_00
+    ; overflow, last sample < minValue
+    LD  HL, $8000           ; last sample = minValue
+filter_00
+;    ADD A, H                ; this sample = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+    JP  next_byte
+
+this_bit0_1
+    BIT 0, C                ; check last bit
+    JR  Z, not_same_01      ; this bit != last bit
+    ; this bit == last bit
+    SLA E
+    RL  D                   ; delta = delta << 1
+    BIT 3, D                ; delta > maxDelta?
+    JR  Z, cont_01          ; no
+    LD  D, 4                ; delta = maxDelta
+    JP  cont_01
+not_same_01
+    SRL D
+    RR  E                   ; delta = delta >> 1
+    BIT 0,E                 ; delta < minDelta?
+    JR  Z, cont_01          ; no
+    LD  E, 2                ; delta = minDelta
+cont_01
+    LD  C, B                ; last bit = this bit
+;    LD  A, H                ; previous last sample high byte
+    AND A                   ; clear CF
+    ADC HL, DE              ; last sample += delta
+    JP  PO, filter_01
+    ; overflow, last sample > maxValue
+    LD  HL, $7FFF           ; last sample = maxValue
+filter_01
+;    ADD A, H                ; this sample high = previous last sample high + last sample high
+;    RR  A                   ; >> 1 => average of last two last sample high bytes
+    LD  A, H                ; this sample = last sample high byte
+    ADD A, $80              ; signed -> unsigned
+    LD  (YMPORT1), A        ; set sample to DAC
+
+next_byte
+    LD  A, XL
+    OR  XH
+    JP  NZ, inner_loop
+
+    EXX                     ; swap bank count and address with last bit, delta, and last sample
+
+    ; subtract length of bank played from current length
+    LD  A, (CURRLENL)
+    SUB L
+    LD  L, A
+    LD  A, (CURRLENM)
+    SBC A, H
+    LD  H, A
+    LD  A, (CURRLENH)
+    LD  B, 0
+    SBC A, B
+    LD  B, A
+
+    ; test if more data
+    OR  H
+    OR  L
+    JP  Z, playback_done    ; no more data
+
+    ; new current length
+    LD  (CURRLENL), HL
+    LD  A, B
+    LD  (CURRLENH), A
+
+    LD  HL, $8000           ; next 32KB (or whatever left if < 32KB)
+    LD  IY, $8000           ; reset bank ptr for next loop
+
+    ; increment bank address
+    LD  A, E
+    ADD A, $80
+    LD  E, A
+    JP  NC, outer_loop
+    INC D
+    JP  outer_loop
+
+playback_done
+    LD  A, (PLAY)
+    OR  A
+    JP  M, restart
+    DEC A
+    LD  (PLAY), A
+    JP  NZ, restart
+
+; done with repeats
+
+    LD  A, $80
+    LD  (YMPORT1), A        ; set silent to DAC
+    JP  idle
+
+pause
+    LD  A, $80
+    LD  (YMPORT1), A        ; set silent to DAC
+paused
+    LD  A, (PAUSE)
+    OR  A
+    JP  Z, inner_loop       ; playback resumed
+    LD  A, (PLAY)
+    OR  A
+    JP  NZ, paused
+    ; playback stopped
+    XOR A
+    LD  (PAUSE), A          ; clear pause
+    JP  idle
+
+; set bank address register to msb of DE - destroys A, B, and C
+
+set_bank
+    LD  BC, BANKREG         ; BC = BANKREG
+
+    LD  A, E                ; A = sample address bit 8-15
+    RLCA
+    LD  (BC), A             ; #1 (bit 15)
+
+    LD  A, D                ; A = sample address bits 16-23
+
+    LD  (BC), A             ; #2 (bit 16)
+    RRCA
+    LD  (BC), A             ; #3 (bit 17)
+    RRCA
+    LD  (BC), A             ; #4 (bit 18)
+    RRCA
+    LD  (BC), A             ; #5 (bit 19)
+    RRCA
+    LD  (BC), A             ; #6 (bit 20)
+    RRCA
+    LD  (BC), A             ; #7 (bit 21)
+    RRCA
+    LD  (BC), A             ; #8 (bit 22)
+    RRCA
+    LD  (BC), A             ; #9 (bit 23)
+
+    RET
+
+#end
